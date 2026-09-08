@@ -76,16 +76,22 @@ quercus_mcp/
 - `quercus.db` — SQLite (WAL). Tables:
   - `courses(id PK, name, code, term, enrollment_state, files_tab_hidden, last_synced_at)`
   - `documents(id PK, course_id, kind, canvas_id, title, url, folder_path,
-    module_id, module_position, content_type, size, canvas_updated_at,
+    module_id, module_name, module_position, content_type, size, version_key,
     due_at, posted_at, locked, local_path, text_path, extract_status,
-    extract_error, indexed_at)` with UNIQUE(course_id, kind, canvas_id)
-  - `documents_fts` — FTS5(title, body, content='') external-content table kept
-    in sync via triggers, with `bm25` ranking and `snippet()`.
-  - `sync_runs(id, started_at, finished_at, scope, added, updated, removed, errors_json)`
+    extract_error, body, extra JSON, removed, first_seen_at, indexed_at)` with
+    UNIQUE(course_id, kind, canvas_id). `version_key` is whatever Canvas value
+    changes when the content changes (file `modified_at|size`, page
+    `updated_at`, assignment `updated_at|submitted|score|due_at`, …).
+  - `documents_fts` — FTS5(title, body) external-content table over
+    `documents` (content='documents'), kept in sync via triggers, `porter
+    unicode61` tokenizer, `bm25` ranking and `snippet()`. Body is only
+    rewritten (and therefore re-indexed) when `version_key` changed.
+  - `sync_runs(id, started_at, finished_at, scope, status, added, updated, removed, errors)`
   - `meta(key, value)` — e.g. token_expires_at, last volatile refresh per course
 - `files/<course_code>/<folder path>/<name>` — raw downloads.
-- `text/<course_code>/<kind>/<slug>.md` — extracted Markdown with a small
-  YAML front-matter (title, kind, url, updated_at).
+- `text/<course_code>/<kind>/<slug>--<canvas_id>.md` — extracted Markdown with
+  a small YAML front-matter (title, kind, url, updated_at). The id suffix keeps
+  `Lecture 1.pdf` and `Lecture 1.pptx` from colliding.
 
 Token: `keyring` service `quercus-mcp`, username = host. Env override
 `QUERCUS_TOKEN`. Canvas does not expose a bearer token's expiry via the API,
@@ -103,7 +109,8 @@ warnings in `sync_status`); actual expiry is detected by a 401 on sync.
      if a module lacks `items`, `GET /modules/:mid/items?include[]=content_details`
    - `GET /courses/:id/pages?include[]=body&per_page=100`
    - `GET /courses/:id/assignments?include[]=submission&per_page=100`
-   - `GET /announcements?context_codes[]=course_:id&start_date=<term start or 1y ago>&per_page=100`
+   - `GET /announcements?context_codes[]=course_:id&start_date=<term start or 1y ago>&end_date=<tomorrow>&per_page=100`
+     (`end_date` is required: Canvas defaults it to start_date + 28 days)
    - `GET /courses/:id/discussion_topics?per_page=100`; for each topic,
      `GET .../discussion_topics/:tid/view` for replies
 3. File discovery (`discover.py`): union of file listing, module items with
@@ -111,9 +118,13 @@ warnings in `sync_status`); actual expiry is detected by a 401 on sync.
    `/courses/(\d+)/files/(\d+)` and `/files/(\d+)`. Files not in the listing
    get metadata via `GET /courses/:cid/files/:fid`. Dedupe by file id.
 4. Change detection: a document is re-fetched/re-extracted only if
-   `canvas_updated_at` differs from stored, or `extract_status` is `error`
-   and `--retry-errors`. Documents no longer present are marked `removed`
-   (soft-delete; excluded from search) rather than deleted.
+   `version_key` differs from stored, `--full` was given, `extract_status` is
+   `error` and `--retry-errors`, the file was previously `locked`/`skipped_size`
+   and now passes those checks, or the local file is missing. Documents no
+   longer present are marked `removed` (soft-delete; excluded from search).
+   A 401 on any per-course endpoint other than files/folders is an
+   `AuthError` and aborts the run without soft-deleting anything; a 403/404
+   means the tab is disabled and that kind is skipped (not deleted).
 5. Download (only when `locked_for_user` is false and `size <= max_file_mb`):
    Bearer → Canvas host; on 302 to a different host, re-request without
    Authorization. On 401/403, try `public_url`. Stream to `files/…`.
@@ -159,7 +170,7 @@ running sync; they read the cache.
 | `read_document` | `doc_id`, `offset=0`, `max_chars=20000` | front-matter + text slice, `has_more` |
 | `get_upcoming` | `days=14`, `course_id?` | assignments due, submission state, points |
 | `get_announcements` | `course_id?`, `since_days=14`, `limit=20` | announcements newest first, body text |
-| `sync` | `course_id?`, `full=false` | summary of the run (counts, errors) |
+| `sync` | `course_id?`, `full=false` | summary of the run; if it takes longer than 45 s, returns "running in background" and `sync_status` shows progress |
 | `sync_status` | — | last runs, per-course state, token state |
 
 Every tool response is prefixed with a one-line warning when the last sync
@@ -194,14 +205,17 @@ AND; if that yields zero hits, retry with OR. Filter by course/kind in SQL.
 | Extraction exception | `extract_status='error'`, error text stored, title still indexed |
 | Rate limited | backoff; never fails the run unless retries exhausted |
 | Module `items` omitted | fetch items endpoint |
-| Course removed from enrollments | course kept, marked `enrollment_state='inactive'`, hidden from `list_courses` default |
+| Course removed from enrollments | course kept, `active=0`, hidden from `list_courses` default |
+| Files/pages/... endpoint 403/404 | kind skipped for this course, nothing soft-deleted |
+| Extraction / disk error | per-document `error`; CPU-bound extraction runs in a worker thread so tools stay responsive |
 
 ### Security
 
 - Token only in keyring or env var; never in config.toml or logs.
 - HTTP logs redact `Authorization`.
 - Extracted text is untrusted; server does not execute or template it.
-- Local files are 0600 / dirs 0700.
+- Process umask 0077 so cache files are 0600 / dirs 0700.
+- `httpx` logging is capped at WARNING so pre-signed S3 URLs don't land in the log.
 
 ## Testing
 

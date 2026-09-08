@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
@@ -17,7 +18,7 @@ from quercus_mcp.canvas.client import CanvasClient
 from quercus_mcp.canvas.errors import AuthError, CanvasError
 from quercus_mcp.config import Config, Paths, get_token
 from quercus_mcp.store import KINDS, DocumentRow, Store
-from quercus_mcp.sync.crawler import Syncer, SyncSummary
+from quercus_mcp.sync.crawler import Syncer, SyncSummary, volatile_stale
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +45,8 @@ class ServerState:
     paths: Paths
     make_syncer: SyncerFactory
     sync_lock: asyncio.Lock
+    sync_wait_seconds: float = 45.0
+    background_tasks: set[asyncio.Task] = field(default_factory=set)
 
     def notice(self) -> str:
         return AUTH_NOTICE if self.store.meta_get("last_auth_error") else ""
@@ -66,24 +69,24 @@ class ServerState:
 
     async def refresh_volatile_if_stale(self, course_ids: list[int]) -> str:
         """Best-effort refresh of announcements/assignments. Returns a note if it failed."""
-        pair = await self.make_syncer()
-        if pair is None:
-            return ""
-        client, syncer = pair
-        stale = [cid for cid in course_ids if syncer.volatile_stale(cid)]
-        if not stale:
-            await client.aclose()
-            return ""
-        try:
-            async with client:
-                for cid in stale:
-                    await syncer.refresh_volatile(cid)
-            return ""
-        except AuthError:
-            self.store.meta_set("last_auth_error", datetime.now(timezone.utc).isoformat())
-            return ""
-        except CanvasError as exc:
-            return f"(live refresh failed with HTTP {exc.status}; showing cached data)\n\n"
+        stale = [cid for cid in course_ids if volatile_stale(self.store, self.config, cid)]
+        if not stale or self.sync_lock.locked():
+            return ""  # fresh enough, or a full sync is already refreshing everything
+        async with self.sync_lock:
+            pair = await self.make_syncer()
+            if pair is None:
+                return ""
+            client, syncer = pair
+            try:
+                async with client:
+                    for cid in stale:
+                        await syncer.refresh_volatile(cid)
+                return ""
+            except AuthError:
+                self.store.meta_set("last_auth_error", datetime.now(timezone.utc).isoformat())
+                return ""
+            except CanvasError as exc:
+                return f"(live refresh failed with HTTP {exc.status}; showing cached data)\n\n"
 
 
 def default_syncer_factory(store: Store, config: Config, paths: Paths) -> SyncerFactory:
@@ -123,11 +126,12 @@ def build_server(state: ServerState, *, lifespan=None) -> MCPServer:  # type: ig
         rows = store.courses(include_inactive=include_past)
         if not rows:
             return state.notice() + "No courses synced yet. Call `sync` (or run `quercus sync`)."
-        lines = ["| id | code | name | term | files | pages | assignments | announcements | last synced |", "|---|---|---|---|---|---|---|---|---|"]
+        lines = ["| id | code | name | term | files | pages | modules | assignments | announcements | discussions | last synced |",
+                 "|---|---|---|---|---|---|---|---|---|---|---|"]
         for c in rows:
             k = store.counts_by_kind(c.id)
-            lines.append(f"| {c.id} | {c.code} | {c.name} | {c.term or ''} | {k.get('file', 0)} | {k.get('page', 0)} | "
-                         f"{k.get('assignment', 0)} | {k.get('announcement', 0)} | {_fmt_dt(c.last_synced_at)} |")
+            lines.append(f"| {c.id} | {c.code} | {c.name} | {c.term or ''} | {k.get('file', 0)} | {k.get('page', 0) + k.get('syllabus', 0)} | "
+                         f"{k.get('module', 0)} | {k.get('assignment', 0)} | {k.get('announcement', 0)} | {k.get('discussion', 0)} | {_fmt_dt(c.last_synced_at)} |")
         return state.notice() + "\n".join(lines)
 
     @server.tool(description="Full-text search across all synced course content (file text, pages, syllabus, modules, "
@@ -170,11 +174,11 @@ def build_server(state: ServerState, *, lifespan=None) -> MCPServer:  # type: ig
         return state.notice() + head + "\n" + body
 
     @server.tool(description="Read a document's extracted text. Use offset/max_chars to page through long files.")
-    async def read_document(doc_id: str, offset: int = 0, max_chars: int = 20000) -> str:
+    async def read_document(doc_id: str | int, offset: int = 0, max_chars: int = 20000) -> str:
         try:
             did = parse_doc_id(doc_id)
         except ValueError:
-            return f"Invalid doc id {doc_id!r}."
+            return state.notice() + f"Invalid doc id {doc_id!r}."
         d = store.get_document(did)
         if d is None:
             return state.notice() + f"No document with id {did}."
@@ -237,7 +241,13 @@ def build_server(state: ServerState, *, lifespan=None) -> MCPServer:  # type: ig
 
     @server.tool(description="Sync courses from Quercus now (incremental by default). Pass full=true to re-download everything.")
     async def sync(course_id: int | None = None, full: bool = False) -> str:
-        result = await state.run_sync(full=full, course_ids=[course_id] if course_id else None)
+        task = asyncio.ensure_future(state.run_sync(full=full, course_ids=[course_id] if course_id else None))
+        state.background_tasks.add(task)
+        task.add_done_callback(state.background_tasks.discard)
+        done, _ = await asyncio.wait({task}, timeout=state.sync_wait_seconds)
+        if not done:
+            return "Sync started and is still running in the background. Call `sync_status` to follow progress."
+        result = task.result()
         if isinstance(result, str):
             return result
         s = result
@@ -318,12 +328,14 @@ async def _scheduler(state: ServerState) -> None:
 
 
 def run_server(paths: Paths | None = None, config: Config | None = None) -> None:
+    os.umask(0o077)  # cache files/dirs are private to the user
     paths = paths or Paths.default()
     config = config or Config.load(paths)
     paths.ensure()
     # stdout is the MCP transport, so log to a file (force=True overrides the CLI's stderr config).
     logging.basicConfig(filename=str(paths.log_path), level=logging.INFO, force=True,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)  # keep pre-signed URLs out of the log
     state = make_state(paths, config)
 
     @contextlib.asynccontextmanager

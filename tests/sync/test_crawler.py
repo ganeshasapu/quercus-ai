@@ -58,8 +58,8 @@ async def test_full_course_sync(env):
     doc10 = store.get_document(files["10"].id)
     assert "--- page 1 ---" in doc10.body
     assert (paths.files_dir / "BIO120" / "lecture1.pdf").exists()
-    assert doc10.text_path and doc10.text_path.endswith("Lecture-1.md")
-    assert (paths.text_dir / "BIO120" / "file" / "Lecture-1.md").read_text().startswith("---\ntitle: \"Lecture 1.pdf\"")
+    assert doc10.text_path and doc10.text_path.endswith("Lecture-1--10.md")
+    assert (paths.text_dir / "BIO120" / "file" / "Lecture-1--10.md").read_text().startswith("---\ntitle: \"Lecture 1.pdf\"")
 
     # page links to files are rewritten to doc URIs; page is attached to its module
     page = store.get_document(store.list_documents(101, "page")[0].id)
@@ -162,6 +162,8 @@ async def test_refresh_volatile_updates_assignments_and_meta(env):
     client, syncer = make_syncer(env)
     async with client:
         await syncer.sync_all()
+        assert syncer.volatile_stale(101) is False  # a full sync counts as fresh
+        store.meta_set("volatile:101", "2020-01-01T00:00:00Z")
         assert syncer.volatile_stale(101) is True
         routes["assignments"].mock(return_value=mc._json([{**mc.ASSIGNMENTS[0], "submission": {"workflow_state": "submitted"}}]))
         summary = await syncer.refresh_volatile(101)
@@ -179,3 +181,135 @@ async def test_course_filters(env):
     async with client:
         summary = await syncer.sync_all()
     assert summary.courses == 0
+
+
+@respx.mock
+async def test_unlocked_file_gets_downloaded(env):
+    paths, store, _ = env
+    routes = mc.mount()
+    routes["download11"] = respx.get(url__startswith=f"{mc.BASE}/files/11/download").mock(
+        return_value=__import__("httpx").Response(302, headers={"Location": mc.S3 + "/11"}))
+    client, syncer = make_syncer(env)
+    async with client:
+        await syncer.sync_all()
+        assert {d.canvas_id: d.extract_status for d in store.list_documents(101, "file")}["11"] == "locked"
+        unlocked = {**mc.FILE_11, "locked_for_user": False, "size": len(mc.PDF_BYTES)}
+        routes["files"].mock(return_value=mc._json([mc.FILE_10, unlocked, mc.FILE_12]))
+        before = routes["s3"].call_count
+        await syncer.sync_all()
+    assert routes["s3"].call_count == before + 1
+    assert {d.canvas_id: d.extract_status for d in store.list_documents(101, "file")}["11"] == "ok"
+
+
+@respx.mock
+async def test_401_on_pages_mid_sync_aborts_without_deleting(env):
+    import httpx
+
+    paths, store, _ = env
+    routes = mc.mount()
+    client, syncer = make_syncer(env)
+    async with client:
+        await syncer.sync_all()
+        routes["pages"].mock(return_value=httpx.Response(401, json={"status": "unauthenticated"}))
+        with pytest.raises(AuthError):
+            await syncer.sync_all()
+    assert len(store.list_documents(101, "page")) == 1  # not soft-deleted
+    assert store.meta_get("last_auth_error") is not None
+
+
+@respx.mock
+async def test_403_on_pages_skips_kind_without_deleting(env):
+    import httpx
+
+    paths, store, _ = env
+    routes = mc.mount()
+    client, syncer = make_syncer(env)
+    async with client:
+        await syncer.sync_all()
+        routes["pages"].mock(return_value=httpx.Response(403, json={"status": "unauthorized"}))
+        summary = await syncer.sync_all()
+    assert summary.status == "ok" and summary.removed == 0
+    assert len(store.list_documents(101, "page")) == 1
+
+
+@respx.mock
+async def test_download_failure_marks_one_doc_and_course_completes(env):
+    import httpx
+
+    paths, store, _ = env
+    routes = mc.mount()
+    routes["download30"].mock(return_value=httpx.Response(500, text="boom"))
+    respx.get(url__startswith=f"{mc.BASE}/api/v1/files/30/public_url").mock(return_value=httpx.Response(500))
+    client, syncer = make_syncer(env)
+    async with client:
+        summary = await syncer.sync_all()
+    assert summary.status == "partial" and any("Outline.pdf" in e for e in summary.errors)
+    files = {d.canvas_id: d for d in store.list_documents(101, "file")}
+    assert files["30"].extract_status == "error" and files["10"].extract_status == "ok"
+
+
+@respx.mock
+async def test_full_redownloads_and_retry_errors(env):
+    import httpx
+
+    paths, store, _ = env
+    routes = mc.mount()
+    routes["download30"].mock(return_value=httpx.Response(500))
+    respx.get(url__startswith=f"{mc.BASE}/api/v1/files/30/public_url").mock(return_value=httpx.Response(500))
+    client, syncer = make_syncer(env)
+    async with client:
+        await syncer.sync_all()
+        before = routes["s3"].call_count
+        await syncer.sync_all(full=True)
+        assert routes["s3"].call_count == before + 1  # file 10 re-downloaded
+        # heal file 30 and retry errors
+        routes["download30"].mock(return_value=httpx.Response(302, headers={"Location": mc.S3 + "/30"}))
+        await syncer.sync_all()
+        assert {d.canvas_id: d.extract_status for d in store.list_documents(101, "file")}["30"] == "error"  # not retried by default
+        syncer.retry_errors = True
+        await syncer.sync_all()
+    assert {d.canvas_id: d.extract_status for d in store.list_documents(101, "file")}["30"] == "ok"
+
+
+@respx.mock
+async def test_second_run_does_not_rewrite_unchanged_bodies(env):
+    paths, store, _ = env
+    mc.mount()
+    client, syncer = make_syncer(env)
+    async with client:
+        await syncer.sync_all()
+        stamps = {d.id: d.indexed_at for d in store.list_documents(101)}
+        await syncer.sync_all()
+    assert {d.id: d.indexed_at for d in store.list_documents(101)} == stamps
+
+
+@respx.mock
+async def test_syllabus_links_are_rewritten_and_volatile_marked_fresh(env):
+    paths, store, _ = env
+    mc.mount()
+    client, syncer = make_syncer(env)
+    async with client:
+        await syncer.sync_all()
+    files = {d.canvas_id: d for d in store.list_documents(101, "file")}
+    syl = store.get_document(store.list_documents(101, "syllabus")[0].id)
+    assert f"quercus://doc/{files['30'].id}" in syl.body
+    assert syncer.volatile_stale(101) is False
+
+
+@respx.mock
+async def test_hostile_filenames_stay_inside_files_dir(env):
+    import httpx
+
+    paths, store, _ = env
+    routes = mc.mount()
+    evil_file = {**mc.FILE_10, "filename": "../../evil.pdf", "display_name": "../../evil.pdf"}
+    routes["files"].mock(return_value=mc._json([evil_file]))
+    routes["folders"].mock(return_value=mc._json([{"id": 1, "full_name": "course files/../../escape", "parent_folder_id": None}]))
+    client, syncer = make_syncer(env)
+    async with client:
+        await syncer.sync_all()
+    d = {x.canvas_id: x for x in store.list_documents(101, "file")}["10"]
+    local = __import__("pathlib").Path(d.local_path).resolve()
+    assert paths.files_dir.resolve() in local.parents
+    assert local.name == ".._.._evil.pdf" or local.name.endswith("evil.pdf")
+    assert not (paths.home.parent / "evil.pdf").exists()

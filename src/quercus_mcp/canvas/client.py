@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from datetime import datetime, timedelta, timezone
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ PER_PAGE = 100
 RATE_LIMIT_TEXT = "rate limit exceeded"
 LOW_RATE_LIMIT = 100.0
 LOW_RATE_LIMIT_PAUSE = 2.0
+SERVER_ERROR_RETRIES = 3
 
 _LINK_RE = re.compile(r'<([^>]+)>;\s*rel="([^"]+)"')
 
@@ -125,7 +127,7 @@ class CanvasClient:
                 await self._sleep(min(2 ** (attempt - 1), 30))
                 continue
             if 500 <= resp.status_code < 600:
-                if attempt >= self._max_retries:
+                if attempt >= min(self._max_retries, SERVER_ERROR_RETRIES):
                     raise CanvasError(resp.status_code, resp.text, url)
                 await self._sleep(min(2 ** (attempt - 1), 30))
                 continue
@@ -242,12 +244,24 @@ class CanvasClient:
         }
         if not include_completed:
             params["enrollment_state"] = "active"
-        courses = [Course.from_api(c) async for c in self.paginate("/api/v1/courses", params) if "id" in c and c.get("access_restricted_by_date") is not True]
-        return courses
+        return [
+            Course.from_api(c)
+            async for c in self.paginate("/api/v1/courses", params)
+            if "id" in c and c.get("access_restricted_by_date") is not True
+        ]
 
-    async def get_course(self, course_id: int) -> Course:
-        return Course.from_api(await self.get_json(f"/api/v1/courses/{course_id}", {"include[]": ["term", "syllabus_body"]}))
+    async def get_course(self, course_id: int) -> Course | None:
+        try:
+            return Course.from_api(await self.get_json(f"/api/v1/courses/{course_id}", {"include[]": ["term", "syllabus_body"]}))
+        except CanvasError as exc:
+            if isinstance(exc, AuthError):
+                raise
+            if exc.status in (403, 404):
+                return None
+            raise
 
+    # Files/folders: Canvas answers 401 (not 403) when the Files tab is hidden
+    # for students, so 401 is *not* treated as an auth failure here.
     async def list_folders(self, course_id: int) -> list[Folder] | None:
         try:
             return [Folder.from_api(f) async for f in self.paginate(f"/api/v1/courses/{course_id}/folders")]
@@ -257,7 +271,7 @@ class CanvasClient:
             raise
 
     async def list_files(self, course_id: int) -> list[File] | None:
-        """All files visible via the Files tab, or None if the tab is hidden (401/403)."""
+        """All files visible via the Files tab, or None if the tab is hidden."""
         try:
             return [File.from_api(f) async for f in self.paginate(f"/api/v1/courses/{course_id}/files")]
         except CanvasError as exc:
@@ -274,22 +288,36 @@ class CanvasClient:
                 return None
             raise
 
-    async def list_modules(self, course_id: int) -> list[Module]:
-        mods = [Module.from_api(m) async for m in self.paginate(f"/api/v1/courses/{course_id}/modules", {"include[]": ["items", "content_details"]})]
-        for m in mods:
-            if m.items is None:
-                m.items = [
-                    ModuleItem.from_api({**it, "module_id": m.id})
-                    async for it in self.paginate(f"/api/v1/courses/{course_id}/modules/{m.id}/items", {"include[]": ["content_details"]})
-                ]
-        return mods
+    # Everything below: 401 means the token is bad → AuthError propagates.
+    # 403/404 mean the tool/tab is disabled for this course → None ("denied").
 
-    async def list_pages(self, course_id: int) -> list[Page]:
+    @staticmethod
+    def _denied(exc: CanvasError) -> bool:
+        if isinstance(exc, AuthError):
+            raise exc
+        return exc.status in (403, 404)
+
+    async def list_modules(self, course_id: int) -> list[Module] | None:
+        try:
+            mods = [Module.from_api(m) async for m in self.paginate(f"/api/v1/courses/{course_id}/modules", {"include[]": ["items", "content_details"]})]
+            for m in mods:
+                if m.items is None:
+                    m.items = [
+                        ModuleItem.from_api({**it, "module_id": m.id})
+                        async for it in self.paginate(f"/api/v1/courses/{course_id}/modules/{m.id}/items", {"include[]": ["content_details"]})
+                    ]
+            return mods
+        except CanvasError as exc:
+            if self._denied(exc):
+                return None
+            raise
+
+    async def list_pages(self, course_id: int) -> list[Page] | None:
         try:
             pages = [Page.from_api(p) async for p in self.paginate(f"/api/v1/courses/{course_id}/pages", {"include[]": ["body"], "published": "true"})]
         except CanvasError as exc:
-            if exc.status in (401, 403, 404):
-                return []
+            if self._denied(exc):
+                return None
             raise
         # Older Canvas builds ignore include[]=body; fetch individually if needed.
         for p in pages:
@@ -297,39 +325,44 @@ class CanvasClient:
                 try:
                     full = await self.get_json(f"/api/v1/courses/{course_id}/pages/{p.url}")
                     p.body = full.get("body")
-                except CanvasError:
+                except CanvasError as exc:
+                    if isinstance(exc, AuthError):
+                        raise
                     p.body = ""
         return pages
 
-    async def list_assignments(self, course_id: int) -> list[Assignment]:
+    async def list_assignments(self, course_id: int) -> list[Assignment] | None:
         try:
             return [Assignment.from_api(a) async for a in self.paginate(f"/api/v1/courses/{course_id}/assignments", {"include[]": ["submission"], "order_by": "due_at"})]
         except CanvasError as exc:
-            if exc.status in (401, 403, 404):
-                return []
+            if self._denied(exc):
+                return None
             raise
 
-    async def list_announcements(self, course_id: int, *, start_date: str) -> list[DiscussionTopic]:
-        params = {"context_codes[]": [f"course_{course_id}"], "start_date": start_date, "active_only": "true"}
+    async def list_announcements(self, course_id: int, *, start_date: str, end_date: str | None = None) -> list[DiscussionTopic] | None:
+        # Canvas defaults end_date to start_date + 28 days, which would hide
+        # everything after the first month of term.
+        end_date = end_date or (datetime.now(timezone.utc) + timedelta(days=1)).date().isoformat()
+        params = {"context_codes[]": [f"course_{course_id}"], "start_date": start_date, "end_date": end_date, "active_only": "true"}
         try:
             return [DiscussionTopic.from_api(a, is_announcement=True) async for a in self.paginate("/api/v1/announcements", params)]
         except CanvasError as exc:
-            if exc.status in (401, 403, 404):
-                return []
+            if self._denied(exc):
+                return None
             raise
 
-    async def list_discussions(self, course_id: int) -> list[DiscussionTopic]:
+    async def list_discussions(self, course_id: int) -> list[DiscussionTopic] | None:
         try:
             return [DiscussionTopic.from_api(t, is_announcement=False) async for t in self.paginate(f"/api/v1/courses/{course_id}/discussion_topics")]
         except CanvasError as exc:
-            if exc.status in (401, 403, 404):
-                return []
+            if self._denied(exc):
+                return None
             raise
 
     async def get_discussion_view(self, course_id: int, topic_id: int) -> dict[str, Any]:
         try:
             return await self.get_json(f"/api/v1/courses/{course_id}/discussion_topics/{topic_id}/view")
         except CanvasError as exc:
-            if exc.status in (401, 403, 404):
+            if self._denied(exc):
                 return {}
             raise

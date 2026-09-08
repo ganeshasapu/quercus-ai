@@ -125,3 +125,27 @@ def test_flatten_discussion_view():
     }
     flat = flatten_discussion_view(view)
     assert [(e["author"], e["depth"]) for e in flat] == [("Ann", 0), ("Bob", 1)]
+
+
+@respx.mock
+async def test_announcements_sends_end_date():
+    route = respx.get(url__startswith=f"{BASE}/api/v1/announcements").mock(return_value=httpx.Response(200, json=[]))
+    async with client() as c:
+        await c.list_announcements(1, start_date="2026-09-01")
+    url = str(route.calls.last.request.url)
+    assert "start_date=2026-09-01" in url and "end_date=20" in url
+
+
+@respx.mock
+async def test_401_on_pages_is_auth_error_but_403_is_denied():
+    from quercus_mcp.canvas.errors import AuthError
+
+    respx.get(url__startswith=f"{BASE}/api/v1/courses/1/pages").mock(return_value=httpx.Response(401, json={"status": "unauthenticated"}))
+    respx.get(url__startswith=f"{BASE}/api/v1/courses/2/pages").mock(return_value=httpx.Response(403, json={"status": "unauthorized"}))
+    respx.get(url__startswith=f"{BASE}/api/v1/courses/2/modules").mock(return_value=httpx.Response(404, json={}))
+    async with client() as c:
+        import pytest
+        with pytest.raises(AuthError):
+            await c.list_pages(1)
+        assert await c.list_pages(2) is None
+        assert await c.list_modules(2) is None

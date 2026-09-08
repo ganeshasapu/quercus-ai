@@ -58,6 +58,8 @@ class Config:
 
     def __post_init__(self) -> None:
         self.base_url = self.base_url.rstrip("/")
+        self.include_courses = [int(x) for x in self.include_courses]
+        self.exclude_courses = [int(x) for x in self.exclude_courses]
 
     @property
     def host(self) -> str:

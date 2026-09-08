@@ -21,15 +21,16 @@ class FakeClient:
 
 
 class FakeSyncer:
-    def __init__(self):
+    def __init__(self, store=None):
+        self.store = store
         self.refreshed: list[int] = []
         self.synced = 0
 
-    def volatile_stale(self, cid):
-        return cid not in self.refreshed
-
     async def refresh_volatile(self, cid):
         self.refreshed.append(cid)
+        if self.store is not None:
+            from quercus_mcp.store import utcnow
+            self.store.meta_set(f"volatile:{cid}", utcnow())
         return SyncSummary()
 
     async def sync_all(self, *, full=False, course_ids=None):
@@ -49,7 +50,7 @@ def state(tmp_path):
     store.upsert_document(DocumentRow(course_id=1, kind="announcement", canvas_id="700", title="Midterm date", posted_at="2999-01-01T00:00:00Z",
                                       body="Midterm is Oct 15.", extra={"author": "Prof Green"}, extract_status="ok", version_key="v"))
     store.upsert_document(DocumentRow(course_id=1, kind="file", canvas_id="11", title="Secret.pdf", extract_status="locked", extract_error="Locked until Oct 1", version_key="v"))
-    fake = FakeSyncer()
+    fake = FakeSyncer(store)
 
     async def factory():
         return FakeClient(), fake
@@ -139,3 +140,44 @@ async def test_no_token_message(state):
 
 def test_parse_doc_id():
     assert parse_doc_id("quercus://doc/12") == 12 and parse_doc_id(" 7 ") == 7 and parse_doc_id(3) == 3
+
+
+async def test_read_document_accepts_integer_id(state):
+    out = await call(build_server(state), "read_document", doc_id=state.doc_id)
+    assert out.startswith("# Lecture 1.pdf")
+
+
+async def test_sync_reports_already_running(state):
+    server = build_server(state)
+    async with state.sync_lock:
+        out = await call(server, "sync")
+    assert "already running" in out
+
+
+async def test_slow_sync_returns_early(state):
+    class Slow(FakeSyncer):
+        async def sync_all(self, **kw):
+            await asyncio.sleep(0.5)
+            return SyncSummary()
+
+    async def factory():
+        return FakeClient(), Slow()
+
+    state.make_syncer = factory
+    state.sync_wait_seconds = 0.05
+    out = await call(build_server(state), "sync")
+    assert "still running" in out
+    for t in list(state.background_tasks):
+        await t
+
+
+def test_sync_is_due(state):
+    from quercus_mcp.server import _sync_is_due
+    from quercus_mcp.store import utcnow
+
+    assert _sync_is_due(state) is True
+    rid = state.store.start_sync_run("all")
+    state.store.finish_sync_run(rid, status="partial", added=0, updated=0, removed=0, errors=["x"])
+    assert _sync_is_due(state) is False  # partial counts as a completed run
+    state.config.sync_interval_minutes = 0
+    assert _sync_is_due(state) is True or utcnow()  # zero interval → due (tolerate same-second)

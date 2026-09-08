@@ -211,7 +211,9 @@ class Store:
         changed = (existing.version_key != d.version_key) or existing.removed or existing.extract_status == "pending"
         params = self._doc_params(d, now)
         params["id"] = existing.id
-        set_body = bool(d.body) or (changed and d.kind != "file")
+        # Only touch body/FTS when something actually changed (avoids re-indexing
+        # the whole corpus on every sync).
+        set_body = changed and (bool(d.body) or d.kind != "file")
         self._db.execute(
             """UPDATE documents SET title=:title, url=:url, folder_path=:folder_path, module_id=:module_id,
                  module_name=:module_name, module_position=:module_position, content_type=:content_type, size=:size,
@@ -252,6 +254,10 @@ class Store:
                  local_path=COALESCE(?, local_path), text_path=COALESCE(?, text_path) WHERE id=?""",
             (body, status, error, utcnow(), local_path, text_path, doc_id),
         )
+        self._db.commit()
+
+    def set_text_path(self, doc_id: int, text_path: str | None) -> None:
+        self._db.execute("UPDATE documents SET text_path=? WHERE id=?", (text_path, doc_id))
         self._db.commit()
 
     def set_document_status(self, doc_id: int, status: str, error: str | None = None) -> None:
@@ -374,7 +380,7 @@ class Store:
         return [SyncRun(r["id"], r["started_at"], r["finished_at"], r["scope"], r["status"], r["added"], r["updated"], r["removed"], json.loads(r["errors"])) for r in rows]
 
     def last_successful_sync(self) -> str | None:
-        r = self._db.execute("SELECT finished_at FROM sync_runs WHERE status='ok' ORDER BY id DESC LIMIT 1").fetchone()
+        r = self._db.execute("SELECT finished_at FROM sync_runs WHERE status IN ('ok', 'partial') ORDER BY id DESC LIMIT 1").fetchone()
         return r["finished_at"] if r else None
 
     # -------------------------------------------------------------- meta

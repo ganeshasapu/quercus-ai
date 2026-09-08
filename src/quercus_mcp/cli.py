@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -24,6 +25,7 @@ def _paths() -> Paths:
 
 @app.callback()
 def _main(verbose: bool = typer.Option(False, "--verbose", "-v", help="Log to stderr")) -> None:
+    os.umask(0o077)  # everything we write under ~/.quercus-mcp is private
     logging.basicConfig(level=logging.INFO if verbose else logging.WARNING, stream=sys.stderr, format="%(levelname)s %(name)s: %(message)s")
 
 

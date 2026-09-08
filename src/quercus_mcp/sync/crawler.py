@@ -34,6 +34,17 @@ def _hash(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8", "replace")).hexdigest()[:16]
 
 
+def volatile_stale(store: Store, config: Config, course_id: int) -> bool:
+    ts = store.meta_get(f"volatile:{course_id}")
+    if ts is None:
+        return True
+    try:
+        last = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    return datetime.now(timezone.utc) - last > timedelta(minutes=config.volatile_ttl_minutes)
+
+
 @dataclass
 class SyncSummary:
     added: int = 0
@@ -63,6 +74,7 @@ class _CourseData:
     assignments: list[Assignment]
     announcements: list[DiscussionTopic]
     discussions: list[DiscussionTopic]
+    denied: set[str] = field(default_factory=set)  # kinds whose endpoint returned 403/404
 
 
 class Syncer:
@@ -81,9 +93,14 @@ class Syncer:
         run_id = self.store.start_sync_run(scope)
         summary = SyncSummary()
         try:
-            courses = await self.client.list_courses(include_completed=self.config.all_terms)
-            courses = [c for c in courses if self._course_selected(c, course_ids)]
-            if not course_ids:
+            listed = await self.client.list_courses(include_completed=self.config.all_terms or bool(course_ids))
+            courses = [c for c in listed if self._course_selected(c, course_ids)]
+            if course_ids:
+                # Explicit ids not in the enrollment listing (e.g. past terms): fetch directly.
+                have = {c.id for c in courses}
+                extra = await asyncio.gather(*(self.client.get_course(cid) for cid in course_ids if cid not in have))
+                courses.extend(c for c in extra if c is not None)
+            else:
                 self.store.deactivate_courses_not_in({c.id for c in courses})
             summary.courses = len(courses)
             sem = asyncio.Semaphore(2)
@@ -97,7 +114,7 @@ class Syncer:
                 if isinstance(r, AuthError):
                     raise r
                 if isinstance(r, BaseException):
-                    log.exception("course %s failed", c.id, exc_info=r)
+                    log.error("course %s failed", c.id, exc_info=r)
                     summary.errors.append(f"{c.code}: {type(r).__name__}: {r}")
                 else:
                     summary.merge(r)
@@ -114,22 +131,23 @@ class Syncer:
             summary.errors.append(f"{type(exc).__name__}: {exc}")
             self.store.finish_sync_run(run_id, status="failed", added=summary.added, updated=summary.updated, removed=summary.removed, errors=summary.errors)
             raise
-        self.store.finish_sync_run(run_id, status="ok" if summary.status == "ok" else "partial", added=summary.added, updated=summary.updated, removed=summary.removed, errors=summary.errors)
+        self.store.finish_sync_run(run_id, status=summary.status, added=summary.added, updated=summary.updated, removed=summary.removed, errors=summary.errors)
         return summary
 
     async def sync_course(self, course: Course, *, full: bool = False) -> SyncSummary:
         summary = SyncSummary(courses=1)
         self.store.upsert_course(_course_row(course))
         data = await self._fetch_course(course)
-        self._sync_syllabus(data, summary)
         file_docs = await self._sync_files(data, summary, full=full)
         rewriter = self._link_rewriter(file_docs)
-        self._sync_pages(data, rewriter, summary)
-        self._sync_modules(data, file_docs, summary)
-        self._sync_assignments(data, rewriter, summary)
-        self._sync_announcements(data, rewriter, summary)
+        await self._sync_syllabus(data, rewriter, summary)
+        await self._sync_pages(data, rewriter, summary)
+        await self._sync_modules(data, file_docs, summary)
+        await self._sync_assignments(data, rewriter, summary)
+        await self._sync_announcements(data, rewriter, summary)
         await self._sync_discussions(data, rewriter, summary)
         self.store.set_course_synced(course.id, files_tab_hidden=data.files_tab_hidden)
+        self.store.meta_set(f"volatile:{course.id}", utcnow())
         return summary
 
     async def refresh_volatile(self, course_id: int) -> SyncSummary:
@@ -143,23 +161,17 @@ class Syncer:
             self.client.list_assignments(course.id),
             self.client.list_announcements(course.id, start_date=self._announcement_start(course)),
         )
-        data = _CourseData(course, {}, False, {}, [], [], assignments, announcements, [])
+        denied = {k for k, v in (("assignment", assignments), ("announcement", announcements)) if v is None}
+        data = _CourseData(course, {}, False, {}, [], [], assignments or [], announcements or [], [], denied)
         file_docs = {int(k): v for k, v in self.store.documents_by_canvas_ids(course.id, "file").items() if k.isdigit()}
         rewriter = self._link_rewriter(file_docs)
-        self._sync_assignments(data, rewriter, summary)
-        self._sync_announcements(data, rewriter, summary)
+        await self._sync_assignments(data, rewriter, summary)
+        await self._sync_announcements(data, rewriter, summary)
         self.store.meta_set(f"volatile:{course_id}", utcnow())
         return summary
 
     def volatile_stale(self, course_id: int) -> bool:
-        ts = self.store.meta_get(f"volatile:{course_id}")
-        if ts is None:
-            return True
-        try:
-            last = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        except ValueError:
-            return True
-        return datetime.now(timezone.utc) - last > timedelta(minutes=self.config.volatile_ttl_minutes)
+        return volatile_stale(self.store, self.config, course_id)
 
     # ------------------------------------------------------------- fetch
 
@@ -187,6 +199,13 @@ class Syncer:
             self.client.list_announcements(cid, start_date=self._announcement_start(course)),
             self.client.list_discussions(cid),
         )
+        denied = {k for k, v in (("module", modules), ("page", pages), ("assignment", assignments),
+                                 ("announcement", announcements), ("discussion", discussions)) if v is None}
+        modules = modules or []
+        pages = pages or []
+        assignments = assignments or []
+        announcements = announcements or []
+        discussions = discussions or []
         folders = {f.id: _clean_folder(f.full_name) for f in (folders_raw or [])}
         files_tab_hidden = files_raw is None
         files: dict[int, File] = {f.id: f for f in (files_raw or [])}
@@ -202,21 +221,20 @@ class Syncer:
         for f in fetched:
             if f is not None:
                 files[f.id] = f
-        return _CourseData(course, folders, files_tab_hidden, files, modules, pages, assignments, announcements, discussions)
+        return _CourseData(course, folders, files_tab_hidden, files, modules, pages, assignments, announcements, discussions, denied)
 
     # ---------------------------------------------------------- per kind
 
-    def _sync_syllabus(self, data: _CourseData, summary: SyncSummary) -> None:
+    async def _sync_syllabus(self, data: _CourseData, rewriter, summary: SyncSummary) -> None:  # type: ignore[no-untyped-def]
         c = data.course
         if not (c.syllabus_body or "").strip():
             self.store.mark_removed(c.id, "syllabus", set())
             return
-        # Rewriter not yet available (files come after); syllabus rarely links docs we need rewritten.
-        md = html_to_markdown(c.syllabus_body)
+        md = html_to_markdown(c.syllabus_body, rewriter)
         row = DocumentRow(course_id=c.id, kind="syllabus", canvas_id="syllabus", title=f"{c.code} — Syllabus",
                           url=f"{self.client.base_url}/courses/{c.id}/assignments/syllabus", version_key=_hash(md),
                           body=md, extract_status="ok")
-        self._upsert_text_doc(row, summary)
+        await self._upsert_text_doc(row, summary)
 
     async def _sync_files(self, data: _CourseData, summary: SyncSummary, *, full: bool) -> dict[int, int]:
         c = data.course
@@ -227,6 +245,7 @@ class Syncer:
                 if it.type == "File" and it.content_id is not None and it.content_id not in module_of:
                     module_of[it.content_id] = it
         doc_ids: dict[int, int] = {}
+        jobs = []
         for f in data.files.values():
             it = module_of.get(f.id)
             mod = module_names.get(it.module_id) if it else None
@@ -243,11 +262,24 @@ class Syncer:
                 summary.added += 1
             elif res.changed:
                 summary.updated += 1
-            await self._maybe_download(c, f, folder, res.doc_id, res.changed, full, summary)
+            jobs.append(self._maybe_download(c, f, folder, res.doc_id, res.changed, full, summary))
+        # Downloads fan out; the client's semaphore bounds real concurrency.
+        await asyncio.gather(*jobs)
         summary.removed += self.store.mark_removed(c.id, "file", {str(i) for i in data.files})
         return doc_ids
 
     async def _maybe_download(self, c: Course, f: File, folder: str | None, doc_id: int, changed: bool, full: bool, summary: SyncSummary) -> None:
+        try:
+            await self._download_and_extract(c, f, folder, doc_id, changed, full, summary)
+        except CanvasError as exc:
+            self.store.set_document_text(doc_id, body="", status="error", error=f"download failed: HTTP {exc.status}")
+            summary.errors.append(f"{c.code}: download {f.display_name}: HTTP {exc.status}")
+        except Exception as exc:  # noqa: BLE001  one bad file must not abort the course
+            log.exception("file %s in %s failed", f.id, c.code)
+            self.store.set_document_text(doc_id, body="", status="error", error=f"{type(exc).__name__}: {exc}"[:500])
+            summary.errors.append(f"{c.code}: {f.display_name}: {type(exc).__name__}: {exc}")
+
+    async def _download_and_extract(self, c: Course, f: File, folder: str | None, doc_id: int, changed: bool, full: bool, summary: SyncSummary) -> None:
         if f.locked_for_user:
             self.store.set_document_status(doc_id, "locked", f.lock_explanation)
             return
@@ -256,27 +288,28 @@ class Syncer:
             return
         existing = self.store.get_document(doc_id)
         need = changed or full or existing is None or existing.extract_status == "pending"
-        if existing is not None and existing.extract_status == "error" and self.retry_errors:
-            need = True
-        if existing is not None and existing.extract_status == "ok" and existing.local_path and not Path(existing.local_path).exists():
-            need = True
+        if existing is not None:
+            if existing.extract_status in ("locked", "skipped_size"):
+                need = True  # it was blocked before and the checks above now pass
+            elif existing.extract_status == "error" and self.retry_errors:
+                need = True
+            elif existing.extract_status == "ok" and existing.local_path and not Path(existing.local_path).exists():
+                need = True
         if not need:
             return
         dest = self.paths.files_dir / slugify(c.code) / (folder or "") / _safe_filename(f.filename or f.display_name)
-        try:
-            await self.client.download_file(f.id, dest, course_id=c.id)
-            summary.downloaded += 1
-        except CanvasError as exc:
-            self.store.set_document_text(doc_id, body="", status="error", error=f"download failed: HTTP {exc.status}")
-            summary.errors.append(f"{c.code}: download {f.display_name}: HTTP {exc.status}")
-            return
-        result = extract_text(dest, f.content_type)
+        await self.client.download_file(f.id, dest, course_id=c.id)
+        summary.downloaded += 1
+        result = await asyncio.to_thread(extract_text, dest, f.content_type)
         text_path = None
         if result.status == "ok":
-            text_path = self._write_text(c, "file", f.display_name, result.text, title=f.display_name, url=f.html_url, updated=f.modified_at or f.updated_at)
+            text_path = await asyncio.to_thread(self._write_text, c.code, "file", f.display_name, str(f.id), result.text,
+                                                title=f.display_name, url=f.html_url, updated=f.modified_at or f.updated_at)
         self.store.set_document_text(doc_id, body=result.text, status=result.status, error=result.error, local_path=str(dest), text_path=text_path)
 
-    def _sync_pages(self, data: _CourseData, rewriter, summary: SyncSummary) -> None:  # type: ignore[no-untyped-def]
+    async def _sync_pages(self, data: _CourseData, rewriter, summary: SyncSummary) -> None:  # type: ignore[no-untyped-def]
+        if "page" in data.denied:
+            return
         c = data.course
         page_module: dict[str, tuple[Module, ModuleItem]] = {}
         for m in data.modules:
@@ -292,10 +325,12 @@ class Syncer:
                               module_id=mod_it[0].id if mod_it else None, module_name=mod_it[0].name if mod_it else None,
                               module_position=(mod_it[0].position * 1000 + mod_it[1].position) if mod_it else None,
                               version_key=p.updated_at or _hash(md), body=md, extract_status="ok", locked=p.locked_for_user)
-            self._upsert_text_doc(row, summary)
+            await self._upsert_text_doc(row, summary)
         summary.removed += self.store.mark_removed(c.id, "page", seen)
 
-    def _sync_modules(self, data: _CourseData, file_docs: dict[int, int], summary: SyncSummary) -> None:
+    async def _sync_modules(self, data: _CourseData, file_docs: dict[int, int], summary: SyncSummary) -> None:
+        if "module" in data.denied:
+            return
         c = data.course
         seen: set[str] = set()
         for m in data.modules:
@@ -325,10 +360,12 @@ class Syncer:
                               url=f"{self.client.base_url}/courses/{c.id}/modules#module_{m.id}",
                               module_id=m.id, module_name=m.name, module_position=m.position * 1000,
                               version_key=_hash(body), body=body, extract_status="ok")
-            self._upsert_text_doc(row, summary)
+            await self._upsert_text_doc(row, summary)
         summary.removed += self.store.mark_removed(c.id, "module", seen)
 
-    def _sync_assignments(self, data: _CourseData, rewriter, summary: SyncSummary) -> None:  # type: ignore[no-untyped-def]
+    async def _sync_assignments(self, data: _CourseData, rewriter, summary: SyncSummary) -> None:  # type: ignore[no-untyped-def]
+        if "assignment" in data.denied:
+            return
         c = data.course
         seen: set[str] = set()
         for a in data.assignments:
@@ -339,10 +376,12 @@ class Syncer:
             row = DocumentRow(course_id=c.id, kind="assignment", canvas_id=str(a.id), title=a.name, url=a.html_url,
                               due_at=a.due_at, version_key=f"{a.updated_at}|{a.submitted}|{a.score}|{a.due_at}",
                               body=md, extra=extra, extract_status="ok")
-            self._upsert_text_doc(row, summary)
+            await self._upsert_text_doc(row, summary)
         summary.removed += self.store.mark_removed(c.id, "assignment", seen)
 
-    def _sync_announcements(self, data: _CourseData, rewriter, summary: SyncSummary) -> None:  # type: ignore[no-untyped-def]
+    async def _sync_announcements(self, data: _CourseData, rewriter, summary: SyncSummary) -> None:  # type: ignore[no-untyped-def]
+        if "announcement" in data.denied:
+            return
         c = data.course
         seen: set[str] = set()
         for t in data.announcements:
@@ -351,10 +390,12 @@ class Syncer:
             row = DocumentRow(course_id=c.id, kind="announcement", canvas_id=str(t.id), title=t.title, url=t.html_url,
                               posted_at=t.posted_at, version_key=t.version_key + "|" + _hash(md), body=md,
                               extra={"author": t.author}, extract_status="ok")
-            self._upsert_text_doc(row, summary)
+            await self._upsert_text_doc(row, summary)
         summary.removed += self.store.mark_removed(c.id, "announcement", seen)
 
     async def _sync_discussions(self, data: _CourseData, rewriter, summary: SyncSummary) -> None:  # type: ignore[no-untyped-def]
+        if "discussion" in data.denied:
+            return
         c = data.course
         seen: set[str] = set()
         for t in data.discussions:
@@ -375,13 +416,13 @@ class Syncer:
             row = DocumentRow(course_id=c.id, kind="discussion", canvas_id=str(t.id), title=t.title, url=t.html_url,
                               posted_at=t.posted_at, version_key=t.version_key, body=body, extra={"author": t.author},
                               extract_status="ok")
-            self._upsert_text_doc(row, summary)
+            await self._upsert_text_doc(row, summary)
         summary.removed += self.store.mark_removed(c.id, "discussion", seen)
 
     # ----------------------------------------------------------- helpers
 
-    def _upsert_text_doc(self, row: DocumentRow, summary: SyncSummary) -> int:
-        res = self.store.upsert_document(row)
+    async def _upsert_text_doc(self, row: DocumentRow, summary: SyncSummary) -> int:
+        res = self.store.upsert_document(row)  # writes body + FTS when changed
         if res.created:
             summary.added += 1
         elif res.changed:
@@ -389,17 +430,23 @@ class Syncer:
         if res.changed:
             course = self.store.get_course(row.course_id)
             code = course.code if course else str(row.course_id)
-            path = self._write_text(Course(id=row.course_id, name="", code=code), row.kind, row.title, row.body,
-                                    title=row.title, url=row.url, updated=row.version_key)
-            self.store.set_document_text(res.doc_id, body=row.body, status="ok", text_path=path)
+            try:
+                path = await asyncio.to_thread(self._write_text, code, row.kind, row.title, row.canvas_id, row.body,
+                                               title=row.title, url=row.url, updated=row.version_key)
+                self.store.set_text_path(res.doc_id, path)
+            except OSError as exc:
+                log.warning("could not write text file for %s/%s: %s", code, row.title, exc)
+                summary.errors.append(f"{code}: write {row.title}: {exc}")
         return res.doc_id
 
-    def _write_text(self, c: Course, kind: str, name: str, text: str, *, title: str, url: str | None, updated: str | None) -> str:
-        d = self.paths.text_dir / slugify(c.code) / kind
+    def _write_text(self, code: str, kind: str, name: str, canvas_id: str, text: str, *, title: str, url: str | None, updated: str | None) -> str:
+        d = self.paths.text_dir / slugify(code) / kind
         d.mkdir(parents=True, exist_ok=True)
-        path = d / (slugify(Path(name).stem if kind == "file" else name) + ".md")
+        base = slugify(Path(name).stem if kind == "file" else name, max_len=60)
+        suffix = canvas_id if canvas_id.isdigit() else _hash(canvas_id)[:8]
+        path = d / (f"{base}--{suffix}.md" if kind != "syllabus" else f"{base}.md")
         front = "\n".join(
-            ["---", f"title: {_yaml_str(title)}", f"kind: {kind}", f"course: {_yaml_str(c.code)}", f"url: {_yaml_str(url or '')}",
+            ["---", f"title: {_yaml_str(title)}", f"kind: {kind}", f"course: {_yaml_str(code)}", f"url: {_yaml_str(url or '')}",
              f"updated: {_yaml_str(updated or '')}", "---", ""]
         )
         path.write_text(front + text + "\n")
