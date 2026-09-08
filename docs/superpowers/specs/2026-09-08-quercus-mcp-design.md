@@ -88,10 +88,9 @@ quercus_mcp/
   YAML front-matter (title, kind, url, updated_at).
 
 Token: `keyring` service `quercus-mcp`, username = host. Env override
-`QUERCUS_TOKEN`. Token expiry recorded from `GET /api/v1/users/self` +
-`/login/session_token`? — no: Canvas does not expose expiry for a bearer
-token; we store the user-entered expiry date at `login` time (optional) and
-otherwise detect expiry by 401.
+`QUERCUS_TOKEN`. Canvas does not expose a bearer token's expiry via the API,
+so `login` optionally records a user-entered expiry date in `meta` (used for
+warnings in `sync_status`); actual expiry is detected by a 401 on sync.
 
 ### Sync
 
