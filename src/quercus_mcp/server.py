@@ -170,7 +170,7 @@ def build_server(state: ServerState, *, lifespan=None) -> MCPServer:  # type: ig
             ordered = sorted(groups.items(), key=lambda kv: (min((d.module_position or 10**9) for d in kv[1]), kv[0]))
             body = "\n".join(f"\n## {g}\n" + "\n".join(_doc_line(d) for d in ds) for g, ds in ordered)
         if course.files_tab_hidden:
-            head += "\n_(The Files tab is hidden for students in this course; files listed were found via modules and links.)_"
+            head += "\n_(Canvas blocks the file listing for students in this course; files shown were found via modules, pages and links.)_"
         return state.notice() + head + "\n" + body
 
     @server.tool(description="Read a document's extracted text. Use offset/max_chars to page through long files.")
@@ -277,7 +277,7 @@ def build_server(state: ServerState, *, lifespan=None) -> MCPServer:  # type: ig
         out.append("\nCourses:")
         for c in store.courses():
             k = store.counts_by_kind(c.id)
-            out.append(f"- {c.code} (id {c.id}): {sum(k.values())} docs, last synced {_fmt_dt(c.last_synced_at)}" + (" — Files tab hidden" if c.files_tab_hidden else ""))
+            out.append(f"- {c.code} (id {c.id}): {sum(k.values())} docs, last synced {_fmt_dt(c.last_synced_at)}" + (" — file listing blocked (files via modules/links)" if c.files_tab_hidden else ""))
         return "\n".join(out)
 
     return server

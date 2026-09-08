@@ -141,7 +141,7 @@ def status() -> None:
         typer.echo("\nCourses:")
         for c in store.courses():
             k = store.counts_by_kind(c.id)
-            typer.echo(f"  {c.code:<12} id={c.id:<7} {sum(k.values()):>4} docs  last sync {c.last_synced_at or '-'}" + ("  [Files tab hidden]" if c.files_tab_hidden else ""))
+            typer.echo(f"  {c.code:<12} id={c.id:<7} {sum(k.values()):>4} docs  last sync {c.last_synced_at or '-'}" + ("  [file listing blocked by Canvas; files found via modules/links]" if c.files_tab_hidden else ""))
         typer.echo("\nRecent syncs:")
         for r in store.sync_runs(5):
             typer.echo(f"  {r.started_at} [{r.status}] +{r.added} ~{r.updated} -{r.removed}" + (f" errors={len(r.errors)}" if r.errors else ""))

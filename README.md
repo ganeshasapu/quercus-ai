@@ -105,9 +105,11 @@ quercus logout
 
 ## How it deals with Canvas quirks
 
-- **Hidden Files tab.** Instructors often hide it; the listing then returns 401 for students. Files
-  are still discovered through module items and links in pages, assignments, announcements and the
-  syllabus, and fetched individually.
+- **No file listing for students.** On Quercus the course-level and per-folder file listings return
+  403 for students in every course (verified live, Sept 2026), even though folders list fine. Files
+  are therefore discovered through module items and links in pages, assignments, announcements and
+  the syllabus, then fetched individually. Files an instructor uploaded but never linked anywhere
+  are invisible to students in the Canvas UI too, so nothing reachable is lost.
 - **Downloads without verifier URLs.** Since mid-2026 Canvas file links need the bearer token. The
   client sends it to the Canvas host and drops it on the redirect to S3; if that fails it falls back
   to the `public_url` endpoint.
