@@ -321,7 +321,9 @@ def run_server(paths: Paths | None = None, config: Config | None = None) -> None
     paths = paths or Paths.default()
     config = config or Config.load(paths)
     paths.ensure()
-    logging.basicConfig(filename=str(paths.log_path), level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # stdout is the MCP transport, so log to a file (force=True overrides the CLI's stderr config).
+    logging.basicConfig(filename=str(paths.log_path), level=logging.INFO, force=True,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     state = make_state(paths, config)
 
     @contextlib.asynccontextmanager

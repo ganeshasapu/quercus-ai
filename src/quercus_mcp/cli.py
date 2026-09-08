@@ -159,6 +159,7 @@ def config(target: str = typer.Argument("claude-desktop", help="claude-desktop |
     paths = _paths()
     cfg = Config.load(paths)
     exe = shutil.which("quercus") or sys.argv[0]
+    exe = str(Path(exe).resolve())
     if target == "show":
         typer.echo(f"config file: {paths.config_path}")
         for k, v in vars(cfg).items():
