@@ -18,6 +18,7 @@ import httpx
 
 from quercus_mcp import __version__
 from quercus_mcp.canvas.errors import AuthError, CanvasError, RateLimitError
+from quercus_mcp.canvas.models import Assignment, Course, DiscussionTopic, File, Folder, Module, ModuleItem, Page
 
 USER_AGENT = f"quercus-mcp/{__version__} (+https://github.com/quercus-mcp)"
 PER_PAGE = 100
@@ -228,3 +229,107 @@ class CanvasClient:
             # allowed to download this file", not "token expired".
             raise CanvasError(resp.status_code, resp.text, url)
         raise CanvasError(0, "too many redirects", url)
+
+    # ---------------------------------------------------------- endpoints
+
+    async def get_self(self) -> dict[str, Any]:
+        return await self.get_json("/api/v1/users/self")
+
+    async def list_courses(self, *, include_completed: bool = False) -> list[Course]:
+        params: dict[str, Any] = {
+            "enrollment_type": "student",
+            "include[]": ["term", "syllabus_body"],
+        }
+        if not include_completed:
+            params["enrollment_state"] = "active"
+        courses = [Course.from_api(c) async for c in self.paginate("/api/v1/courses", params) if "id" in c and c.get("access_restricted_by_date") is not True]
+        return courses
+
+    async def get_course(self, course_id: int) -> Course:
+        return Course.from_api(await self.get_json(f"/api/v1/courses/{course_id}", {"include[]": ["term", "syllabus_body"]}))
+
+    async def list_folders(self, course_id: int) -> list[Folder] | None:
+        try:
+            return [Folder.from_api(f) async for f in self.paginate(f"/api/v1/courses/{course_id}/folders")]
+        except CanvasError as exc:
+            if exc.status in (401, 403, 404):
+                return None
+            raise
+
+    async def list_files(self, course_id: int) -> list[File] | None:
+        """All files visible via the Files tab, or None if the tab is hidden (401/403)."""
+        try:
+            return [File.from_api(f) async for f in self.paginate(f"/api/v1/courses/{course_id}/files")]
+        except CanvasError as exc:
+            if exc.status in (401, 403, 404):
+                return None
+            raise
+
+    async def get_file(self, course_id: int | None, file_id: int) -> File | None:
+        path = f"/api/v1/courses/{course_id}/files/{file_id}" if course_id else f"/api/v1/files/{file_id}"
+        try:
+            return File.from_api(await self.get_json(path))
+        except CanvasError as exc:
+            if exc.status in (401, 403, 404):
+                return None
+            raise
+
+    async def list_modules(self, course_id: int) -> list[Module]:
+        mods = [Module.from_api(m) async for m in self.paginate(f"/api/v1/courses/{course_id}/modules", {"include[]": ["items", "content_details"]})]
+        for m in mods:
+            if m.items is None:
+                m.items = [
+                    ModuleItem.from_api({**it, "module_id": m.id})
+                    async for it in self.paginate(f"/api/v1/courses/{course_id}/modules/{m.id}/items", {"include[]": ["content_details"]})
+                ]
+        return mods
+
+    async def list_pages(self, course_id: int) -> list[Page]:
+        try:
+            pages = [Page.from_api(p) async for p in self.paginate(f"/api/v1/courses/{course_id}/pages", {"include[]": ["body"], "published": "true"})]
+        except CanvasError as exc:
+            if exc.status in (401, 403, 404):
+                return []
+            raise
+        # Older Canvas builds ignore include[]=body; fetch individually if needed.
+        for p in pages:
+            if p.body is None:
+                try:
+                    full = await self.get_json(f"/api/v1/courses/{course_id}/pages/{p.url}")
+                    p.body = full.get("body")
+                except CanvasError:
+                    p.body = ""
+        return pages
+
+    async def list_assignments(self, course_id: int) -> list[Assignment]:
+        try:
+            return [Assignment.from_api(a) async for a in self.paginate(f"/api/v1/courses/{course_id}/assignments", {"include[]": ["submission"], "order_by": "due_at"})]
+        except CanvasError as exc:
+            if exc.status in (401, 403, 404):
+                return []
+            raise
+
+    async def list_announcements(self, course_id: int, *, start_date: str) -> list[DiscussionTopic]:
+        params = {"context_codes[]": [f"course_{course_id}"], "start_date": start_date, "active_only": "true"}
+        try:
+            return [DiscussionTopic.from_api(a, is_announcement=True) async for a in self.paginate("/api/v1/announcements", params)]
+        except CanvasError as exc:
+            if exc.status in (401, 403, 404):
+                return []
+            raise
+
+    async def list_discussions(self, course_id: int) -> list[DiscussionTopic]:
+        try:
+            return [DiscussionTopic.from_api(t, is_announcement=False) async for t in self.paginate(f"/api/v1/courses/{course_id}/discussion_topics")]
+        except CanvasError as exc:
+            if exc.status in (401, 403, 404):
+                return []
+            raise
+
+    async def get_discussion_view(self, course_id: int, topic_id: int) -> dict[str, Any]:
+        try:
+            return await self.get_json(f"/api/v1/courses/{course_id}/discussion_topics/{topic_id}/view")
+        except CanvasError as exc:
+            if exc.status in (401, 403, 404):
+                return {}
+            raise
