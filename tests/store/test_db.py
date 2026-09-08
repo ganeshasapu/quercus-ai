@@ -21,25 +21,25 @@ def doc(**kw):
 
 
 def test_upsert_new_then_unchanged_then_changed(store):
-    doc_id, changed = store.upsert_document(doc())
-    assert changed is True
+    doc_id, changed, created = store.upsert_document(doc())
+    assert changed is True and created is True
     store.set_document_text(doc_id, body="hello world", status="ok")
-    same_id, changed = store.upsert_document(doc())
-    assert same_id == doc_id and changed is False
+    same_id, changed, created = store.upsert_document(doc())
+    assert same_id == doc_id and changed is False and created is False
     assert store.get_document(doc_id).body == "hello world"  # body preserved
-    _, changed = store.upsert_document(doc(version_key="v2"))
-    assert changed is True
+    _, changed, created = store.upsert_document(doc(version_key="v2"))
+    assert changed is True and created is False
 
 
 def test_non_file_kinds_update_body_on_change(store):
-    doc_id, _ = store.upsert_document(doc(kind="page", canvas_id="intro", body="old", extract_status="ok"))
+    doc_id, _, _ = store.upsert_document(doc(kind="page", canvas_id="intro", body="old", extract_status="ok"))
     store.upsert_document(doc(kind="page", canvas_id="intro", body="new", version_key="v2", extract_status="ok"))
     assert store.get_document(doc_id).body == "new"
 
 
 def test_search_ranks_and_snippets(store):
-    a, _ = store.upsert_document(doc(canvas_id="1", title="Photosynthesis lecture", body="Chlorophyll absorbs light. " * 5, extract_status="ok"))
-    b, _ = store.upsert_document(doc(canvas_id="2", title="Unrelated", body="Sorting algorithms and heaps.", extract_status="ok"))
+    a, _, _ = store.upsert_document(doc(canvas_id="1", title="Photosynthesis lecture", body="Chlorophyll absorbs light. " * 5, extract_status="ok"))
+    b, _, _ = store.upsert_document(doc(canvas_id="2", title="Unrelated", body="Sorting algorithms and heaps.", extract_status="ok"))
     hits = store.search("chlorophyll")
     assert [h.doc_id for h in hits] == [a]
     assert "[Chlorophyll]" in hits[0].snippet
@@ -47,16 +47,16 @@ def test_search_ranks_and_snippets(store):
 
 
 def test_search_and_then_or_fallback(store):
-    a, _ = store.upsert_document(doc(canvas_id="1", title="Heaps", body="binary heap operations", extract_status="ok"))
-    b, _ = store.upsert_document(doc(canvas_id="2", title="Trees", body="red black tree rotations", extract_status="ok"))
+    a, _, _ = store.upsert_document(doc(canvas_id="1", title="Heaps", body="binary heap operations", extract_status="ok"))
+    b, _, _ = store.upsert_document(doc(canvas_id="2", title="Trees", body="red black tree rotations", extract_status="ok"))
     # AND matches nothing (no doc has both), OR fallback returns both
     ids = {h.doc_id for h in store.search("heap rotations")}
     assert ids == {a, b}
 
 
 def test_search_filters_course_kind_and_removed(store):
-    a, _ = store.upsert_document(doc(course_id=1, canvas_id="1", body="entropy", extract_status="ok"))
-    b, _ = store.upsert_document(doc(course_id=2, kind="page", canvas_id="p", body="entropy", extract_status="ok"))
+    a, _, _ = store.upsert_document(doc(course_id=1, canvas_id="1", body="entropy", extract_status="ok"))
+    b, _, _ = store.upsert_document(doc(course_id=2, kind="page", canvas_id="p", body="entropy", extract_status="ok"))
     assert {h.doc_id for h in store.search("entropy")} == {a, b}
     assert [h.doc_id for h in store.search("entropy", course_id=2)] == [b]
     assert [h.doc_id for h in store.search("entropy", kind="page")] == [b]
@@ -75,7 +75,7 @@ def test_mark_removed_keeps_listed(store):
     assert n == 1
     assert [d.canvas_id for d in store.list_documents(1, "file")] == ["1"]
     # re-upserting a removed doc revives it
-    _, changed = store.upsert_document(doc(canvas_id="2"))
+    _, changed, _ = store.upsert_document(doc(canvas_id="2"))
     assert changed is True and len(store.list_documents(1, "file")) == 2
 
 

@@ -7,7 +7,7 @@ import sqlite3
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from quercus_mcp.store.query import fts_query
 
@@ -70,6 +70,12 @@ class DocumentRow:
         d["removed"] = bool(d.get("removed"))
         d.setdefault("body", "")
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+class UpsertResult(NamedTuple):
+    doc_id: int
+    changed: bool
+    created: bool
 
 
 @dataclass
@@ -182,9 +188,9 @@ class Store:
         ).fetchone()
         return DocumentRow.from_sql(r) if r else None
 
-    def upsert_document(self, d: DocumentRow) -> tuple[int, bool]:
-        """Insert or update metadata. Returns (doc_id, changed) where changed is
-        True for new documents or when version_key differs from the stored one.
+    def upsert_document(self, d: DocumentRow) -> UpsertResult:
+        """Insert or update metadata. `changed` is True for new documents or when
+        version_key differs from the stored one; `created` only for new rows.
         Body/extract fields are only written when the document is new or
         `d.body` is non-empty (callers set text via set_document_text)."""
         existing = self.get_document_meta(d.course_id, d.kind, d.canvas_id)
@@ -200,7 +206,7 @@ class Store:
                 self._doc_params(d, now),
             )
             self._db.commit()
-            return int(cur.lastrowid), True
+            return UpsertResult(int(cur.lastrowid), True, True)
 
         changed = (existing.version_key != d.version_key) or existing.removed or existing.extract_status == "pending"
         params = self._doc_params(d, now)
@@ -219,7 +225,7 @@ class Store:
                 params,
             )
         self._db.commit()
-        return int(existing.id), bool(changed)
+        return UpsertResult(int(existing.id), bool(changed), False)
 
     @staticmethod
     def _doc_params(d: DocumentRow, now: str) -> dict[str, Any]:
